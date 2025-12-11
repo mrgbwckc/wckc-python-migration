@@ -1,61 +1,72 @@
 import pandas as pd
 import numpy as np
+import sys
 from datetime import datetime
 from sqlalchemy import text
-from migration_utils import get_db_engine, clean_boolean, clean_date
+from migration_utils import get_db_engine, clean_boolean
 
 # =================CONFIGURATION=================
 INPUT_FILE = './data/DataFinal.xlsx'
 # ===============================================
 
-# --- HELPER FUNCTIONS ---
-def clean_money(val):
-    if pd.isna(val): return 0.0
+# --- 1. ROBUST CLEANING FUNCTIONS ---
+
+def clean_val(val):
+    if val is None: return None
+    if isinstance(val, float) and np.isnan(val): return None
     s = str(val).strip()
-    if s == '': return 0.0
-    try:
-        return float(s.replace('$', '').replace(',', ''))
-    except ValueError:
-        return 0.0
+    return None if s.lower() == 'nan' or s == '' else s
+
+def clean_money(val):
+    v = clean_val(val)
+    if v is None: return 0.0
+    try: return float(v.replace('$', '').replace(',', ''))
+    except ValueError: return 0.0
+
+def clean_date_strict(val):
+    if pd.isna(val) or val == '': return None
+    if isinstance(val, datetime): return val
+    try: return pd.to_datetime(val, dayfirst=True)
+    except: return None
 
 def clean_timestamp_special(val):
-    if pd.isna(val) or val == '': return None
-    s = str(val).strip().upper()
-    if s in ['Y', 'YES', 'T', 'TRUE', 'COMP', 'COMPLETE']:
+    v = clean_val(val)
+    if v is None: return None
+    if v.upper() in ['Y', 'YES', 'T', 'TRUE', 'COMP', 'COMPLETE']:
         return datetime(1999, 9, 19)
-    if s in ['N', 'NO', 'F', 'FALSE']:
-        return None
-    return clean_date(val)
+    return clean_date_strict(val)
+
+def clean_text_multiline(val):
+    v = clean_val(val)
+    return v.replace('\\n', '\n') if v else None
 
 def parse_legacy_job_number(job_num_raw):
-    s = str(job_num_raw).strip()
-    if '-' in s:
-        parts = s.split('-', 1)
+    v = clean_val(job_num_raw)
+    if v is None: return None, None
+    if '-' in v:
+        parts = v.split('-', 1)
         try: return int(parts[0]), parts[1]
-        except ValueError: return None, s
+        except ValueError: return None, v
     else:
-        try: return int(s), None
-        except ValueError: return None, s
+        try: return int(v), None
+        except ValueError: return None, v
 
+# --- 2. LOOKUP FETCHING ---
 def fetch_lookups(conn):
-    print("🔄 Fetching lookup maps...")
-    # 1. Clients
+    print("🔄 Fetching lookup maps...", flush=True)
+    
     clients = pd.read_sql("SELECT id, legacy_id FROM public.client", conn)
     client_map = dict(zip(clients['legacy_id'].astype(str).str.strip(), clients['id']))
     
-    # 2. Species
     species = pd.read_sql('SELECT "Id", "Species" FROM public.species', conn)
     species_map = dict(zip(species['Species'].str.strip(), species['Id']))
     
-    # 3. Colors
     colors = pd.read_sql('SELECT "Id", "Name" FROM public.colors', conn)
     color_map = dict(zip(colors['Name'].str.strip(), colors['Id']))
     
-    # 4. Doors
     doors = pd.read_sql("SELECT id, name FROM public.door_styles", conn)
     door_map = dict(zip(doors['name'].str.strip(), doors['id']))
 
-    # 5. Installers
     try:
         installers = pd.read_sql("SELECT installer_id, legacy_installer_id FROM public.installers", conn)
         installers = installers.dropna(subset=['legacy_installer_id'])
@@ -65,36 +76,77 @@ def fetch_lookups(conn):
 
     return client_map, species_map, color_map, door_map, installer_map
 
-# --- DATABASE INSERTION FUNCTION ---
-def insert_single_job(conn, data):
-    """
-    Inserts a single job transactionally.
-    Returns the new Job ID if successful.
-    """
-    
-    # 1. INSERT CABINET
-    sql_cab = text("""
+# --- 3. DATABASE INSERT FUNCTIONS ---
+
+def insert_cabinet(conn, data):
+    sql = text("""
         INSERT INTO public.cabinets (
-            species_id, color_id, door_style_id, 
-            finish, glaze, top_drawer_front, interior, drawer_box, 
-            drawer_hardware, box, hinge_soft_close, doors_parts_only, 
-            handles_supplied, handles_selected, glass, piece_count, glass_type
+            species_id, color_id, door_style_id, finish, glaze, 
+            top_drawer_front, interior, drawer_box, drawer_hardware, box, 
+            hinge_soft_close, doors_parts_only, handles_supplied, handles_selected, 
+            glass, piece_count, glass_type
         ) VALUES (
-            :species_id, :color_id, :door_style_id, 
-            :finish, :glaze, :top_drawer_front, :interior, :drawer_box, 
-            :drawer_hardware, :box, :hinge_soft_close, :doors_parts_only, 
-            :handles_supplied, :handles_selected, :glass, :piece_count, :glass_type
+            :species_id, :color_id, :door_style_id, :finish, :glaze, 
+            :top_drawer_front, :interior, :drawer_box, :drawer_hardware, :box, 
+            :hinge_soft_close, :doors_parts_only, :handles_supplied, :handles_selected, 
+            :glass, :piece_count, :glass_type
         ) RETURNING id
     """)
-    result = conn.execute(sql_cab, data['cabinet'])
-    cabinet_id = result.fetchone()[0]
+    return conn.execute(sql, data).fetchone()[0]
 
-    # 2. INSERT PRODUCTION SCHEDULE
-    sql_prod = text("""
+def insert_sales_order(conn, data, cabinet_id):
+    params = {**data, **data['shipping'], **data['checklist'], 'cabinet_id': cabinet_id}
+    
+    if params.get('created_at') is None:
+        sql = text("""
+            INSERT INTO public.sales_orders (
+                client_id, cabinet_id, stage, total, deposit, designer, comments,
+                install, order_type, delivery_type, sales_order_number, 
+                shipping_client_name, shipping_street, shipping_city, shipping_province, 
+                shipping_zip, shipping_phone_1, shipping_phone_2, shipping_email_1, shipping_email_2,
+                layout_date, client_meeting_date, follow_up_date, appliance_specs_date, 
+                selections_date, markout_date, review_date, second_markout_date, 
+                flooring_type, flooring_clearance
+            ) VALUES (
+                :client_id, :cabinet_id, :stage, :total, :deposit, :designer, :comments,
+                :install, :order_type, :delivery_type, :sales_order_number, 
+                :shipping_client_name, :shipping_street, :shipping_city, :shipping_province, 
+                :shipping_zip, :shipping_phone_1, :shipping_phone_2, :shipping_email_1, :shipping_email_2,
+                :layout_date, :client_meeting_date, :follow_up_date, :appliance_specs_date, 
+                :selections_date, :markout_date, :review_date, :second_markout_date, 
+                :flooring_type, :flooring_clearance
+            ) RETURNING id
+        """)
+    else:
+        sql = text("""
+            INSERT INTO public.sales_orders (
+                client_id, cabinet_id, stage, total, deposit, designer, comments,
+                install, order_type, delivery_type, sales_order_number, created_at,
+                shipping_client_name, shipping_street, shipping_city, shipping_province, 
+                shipping_zip, shipping_phone_1, shipping_phone_2, shipping_email_1, shipping_email_2,
+                layout_date, client_meeting_date, follow_up_date, appliance_specs_date, 
+                selections_date, markout_date, review_date, second_markout_date, 
+                flooring_type, flooring_clearance
+            ) VALUES (
+                :client_id, :cabinet_id, :stage, :total, :deposit, :designer, :comments,
+                :install, :order_type, :delivery_type, :sales_order_number, :created_at,
+                :shipping_client_name, :shipping_street, :shipping_city, :shipping_province, 
+                :shipping_zip, :shipping_phone_1, :shipping_phone_2, :shipping_email_1, :shipping_email_2,
+                :layout_date, :client_meeting_date, :follow_up_date, :appliance_specs_date, 
+                :selections_date, :markout_date, :review_date, :second_markout_date, 
+                :flooring_type, :flooring_clearance
+            ) RETURNING id
+        """)
+    return conn.execute(sql, params).fetchone()[0]
+
+def insert_production(conn, data):
+    # Added in_plant_actual to the query
+    sql = text("""
         INSERT INTO public.production_schedule (
             rush, placement_date, doors_in_schedule, doors_out_schedule,
             cut_finish_schedule, cut_melamine_schedule, paint_in_schedule,
             paint_out_schedule, assembly_schedule, ship_schedule, production_comments,
+            in_plant_actual,
             doors_completed_actual, cut_finish_completed_actual, cut_melamine_completed_actual,
             paint_completed_actual, assembly_completed_actual, custom_finish_completed_actual,
             ship_status
@@ -102,16 +154,16 @@ def insert_single_job(conn, data):
             :rush, :placement_date, :doors_in_schedule, :doors_out_schedule,
             :cut_finish_schedule, :cut_melamine_schedule, :paint_in_schedule,
             :paint_out_schedule, :assembly_schedule, :ship_schedule, :production_comments,
+            :in_plant_actual,
             :doors_completed_actual, :cut_finish_completed_actual, :cut_melamine_completed_actual,
             :paint_completed_actual, :assembly_completed_actual, :custom_finish_completed_actual,
             :ship_status
         ) RETURNING prod_id
     """)
-    result = conn.execute(sql_prod, data['production'])
-    prod_id = result.fetchone()[0]
+    return conn.execute(sql, data).fetchone()[0]
 
-    # 3. INSERT INSTALLATION
-    sql_inst = text("""
+def insert_installation(conn, data):
+    sql = text("""
         INSERT INTO public.installation (
             installer_id, has_shipped, installation_date, installation_completed,
             inspection_date, wrap_date, wrap_completed, installation_notes
@@ -120,62 +172,22 @@ def insert_single_job(conn, data):
             :inspection_date, :wrap_date, :wrap_completed, :installation_notes
         ) RETURNING installation_id
     """)
-    result = conn.execute(sql_inst, data['installation'])
-    installation_id = result.fetchone()[0]
+    return conn.execute(sql, data).fetchone()[0]
 
-    # 4. INSERT SALES ORDER
-    so_data = data['sales_order'].copy()
-    so_data['cabinet_id'] = cabinet_id
-    
-    so_params = {
-        **so_data, 
-        **so_data['shipping'], 
-        **so_data['checklist']
-    }
-
-    sql_so = text("""
-        INSERT INTO public.sales_orders (
-            client_id, cabinet_id, stage, total, deposit, designer, comments,
-            install, order_type, delivery_type, sales_order_number,
-            shipping_client_name, shipping_street, shipping_city, shipping_province, 
-            shipping_zip, shipping_phone_1, shipping_phone_2, shipping_email_1, shipping_email_2,
-            layout_date, client_meeting_date, follow_up_date, appliance_specs_date, 
-            selections_date, markout_date, review_date, second_markout_date, 
-            flooring_type, flooring_clearance
-        ) VALUES (
-            :client_id, :cabinet_id, :stage, :total, :deposit, :designer, :comments,
-            :install, :order_type, :delivery_type, :sales_order_number,
-            :shipping_client_name, :shipping_street, :shipping_city, :shipping_province, 
-            :shipping_zip, :shipping_phone_1, :shipping_phone_2, :shipping_email_1, :shipping_email_2,
-            :layout_date, :client_meeting_date, :follow_up_date, :appliance_specs_date, 
-            :selections_date, :markout_date, :review_date, :second_markout_date, 
-            :flooring_type, :flooring_clearance
-        ) RETURNING id
-    """)
-    result = conn.execute(sql_so, so_params)
-    sales_order_id = result.fetchone()[0]
-
-    # 5. INSERT JOB
-    job_params = {
-        **data['job'],
-        'sales_order_id': sales_order_id,
-        'prod_id': prod_id,
-        'installation_id': installation_id
-    }
-    
-    sql_job = text("""
+def insert_job(conn, data, so_id, prod_id, install_id):
+    params = {**data, 'sales_order_id': so_id, 'prod_id': prod_id, 'installation_id': install_id}
+    sql = text("""
         INSERT INTO public.jobs (
             job_base_number, job_suffix, sales_order_id, prod_id, installation_id, is_active
         ) VALUES (
             :job_base_number, :job_suffix, :sales_order_id, :prod_id, :installation_id, :is_active
         ) RETURNING id
     """)
-    result = conn.execute(sql_job, job_params)
-    job_id = result.fetchone()[0]
+    return conn.execute(sql, params).fetchone()[0]
 
-    # 6. INSERT PURCHASING TRACKING
-    purch_params = {**data['purchasing'], 'job_id': job_id}
-    sql_purch = text("""
+def insert_purchasing(conn, data, job_id):
+    params = {**data, 'job_id': job_id}
+    sql = text("""
         INSERT INTO public.purchase_tracking (
             job_id, doors_ordered_at, glass_ordered_at, handles_ordered_at, 
             acc_ordered_at, purchasing_comments
@@ -184,67 +196,65 @@ def insert_single_job(conn, data):
             :acc_ordered_at, :purchasing_comments
         )
     """)
-    conn.execute(sql_purch, purch_params)
+    conn.execute(sql, params)
 
-    return job_id
+# --- 4. MAIN MIGRATION LOGIC ---
 
-# --- MAIN EXECUTION ---
 def migrate_jobs():
     engine = get_db_engine()
     if not engine: return
 
-    # 1. Load Excel
-    print(f"📂 Reading Excel Data from {INPUT_FILE}...")
+    print(f"📂 Reading Excel Data from {INPUT_FILE}...", flush=True)
     xls = pd.ExcelFile(INPUT_FILE)
     df_so = pd.read_excel(xls, 'SalesOrders')
     df_dc = pd.read_excel(xls, 'DesignChecks')
     df_oc = pd.read_excel(xls, 'OrderChecks')
 
-    # Clean keys
-    df_so['SALES_OR'] = df_so['SALES_OR'].astype(str).str.strip()
-    df_dc['SALES_OR'] = df_dc['SALES_OR'].astype(str).str.strip()
-    df_oc['SALES_OR'] = df_oc['SALES_OR'].astype(str).str.strip()
-
-    # 2. Select ALL Unique IDs
-    # CHANGED: Removed [:5] slice to process everything
+    # Aggressive ID Cleaning
+    df_so['SALES_OR'] = df_so['SALES_OR'].apply(clean_val)
+    df_dc['SALES_OR'] = df_dc['SALES_OR'].apply(clean_val)
+    df_oc['SALES_OR'] = df_oc['SALES_OR'].apply(clean_val)
+    
+    df_so = df_so.dropna(subset=['SALES_OR'])
     all_ids = df_so['SALES_OR'].unique()
     total_count = len(all_ids)
-    print(f"🔎 Found {total_count} Unique Sales Orders to Process.")
+    print(f"🔎 Found {total_count} Unique Sales Orders.", flush=True)
 
-    # 3. Start DB Session
     with engine.connect() as conn:
-        # Get Lookups inside the connection context
         client_map, species_map, color_map, door_map, installer_map = fetch_lookups(conn)
-        
-        # 🟢 CRITICAL: Commit the read transaction to clear the connection state
-        conn.commit()
-        print("✅ Lookups loaded. Read transaction closed. Starting Inserts...")
+        conn.commit() 
+        print("✅ Lookups loaded. Starting Inserts...", flush=True)
 
-        success_count = 0
-        skip_count = 0
+        success_quotes = 0
+        success_jobs = 0
         fail_count = 0
+        skip_count = 0
 
         for index, so_id in enumerate(all_ids):
-            # Print progress every 10 rows
-            if index % 10 == 0:
-                print(f"⏳ Processing {index + 1}/{total_count} (SO: {so_id})...")
+            if index % 10 == 0: 
+                print(f"⏳ Processing {index + 1}/{total_count}...", flush=True)
             
-            # --- EXTRACT & TRANSFORM ---
             try:
+                # --- EXTRACT ---
                 row_so = df_so[df_so['SALES_OR'] == so_id].iloc[0]
                 row_dc = df_dc[df_dc['SALES_OR'] == so_id].iloc[0] if not df_dc[df_dc['SALES_OR'] == so_id].empty else pd.Series()
                 row_oc = df_oc[df_oc['SALES_OR'] == so_id].iloc[0] if not df_oc[df_oc['SALES_OR'] == so_id].empty else pd.Series()
 
+                # --- TRANSFORM ---
                 # A. Cabinet
-                cabinet_data = {
-                    "species_id": species_map.get(str(row_so.get('SPECIES', '')).strip()),
-                    "color_id": color_map.get(str(row_so.get('COLOR', '')).strip()),
-                    "door_style_id": door_map.get(str(row_so.get('LOWER_DOOR', '')).strip()),
-                    "finish": row_so.get('FINISH'), "glaze": row_so.get('GLAZE'),
-                    "top_drawer_front": row_so.get('DWR_FRONT'), "interior": row_so.get('INTERIOR'),
-                    "drawer_box": row_so.get('DWR'), "drawer_hardware": row_so.get('DWR_HRW'),
-                    "box": str(row_so.get('BOX', '')), "piece_count": str(row_so.get('PIECE_COUNT', '')),
-                    "glass_type": row_so.get('GLASS_TYPE'),
+                cabinet_payload = {
+                    "species_id": species_map.get(clean_val(row_so.get('SPECIES'))),
+                    "color_id": color_map.get(clean_val(row_so.get('COLOR'))),
+                    "door_style_id": door_map.get(clean_val(row_so.get('LOWER_DOOR'))),
+                    "finish": clean_val(row_so.get('FINISH')),
+                    "glaze": clean_val(row_so.get('GLAZE')),
+                    "top_drawer_front": clean_val(row_so.get('DWR_FRONT')),
+                    "interior": clean_val(row_so.get('INTERIOR')),
+                    "drawer_box": clean_val(row_so.get('DWR')),
+                    "drawer_hardware": clean_val(row_so.get('DWR_HRW')),
+                    "box": clean_val(row_so.get('BOX')),
+                    "piece_count": clean_val(row_so.get('PIECE_COUNT')),
+                    "glass_type": clean_val(row_so.get('GLASS_TYPE')),
                     "hinge_soft_close": clean_boolean(row_so.get('HINGE_SC')),
                     "doors_parts_only": clean_boolean(row_so.get('DOORS_PARTS_ONLY')),
                     "handles_supplied": clean_boolean(row_so.get('HANDLES')),
@@ -253,119 +263,143 @@ def migrate_jobs():
                 }
 
                 # B. Sales Order
-                sales_order_data = {
-                    "client_id": client_map.get(str(row_so.get('CLIENT_NO', '')).strip()),
-                    "stage": row_so.get('STAGE', 'QUOTE').upper() if row_so.get('STAGE') else 'QUOTE',
-                    "total": clean_money(row_so.get('TOTAL')), "deposit": clean_money(row_so.get('DEPOSIT')),
-                    "designer": row_so.get('DESIGNER'), "comments": row_so.get('COMMENTS'),
-                    "install": clean_boolean(row_so.get('INSTALL')),
-                    "order_type": row_so.get('ORDER_TYPE'), "delivery_type": row_so.get('DEL_TYPE'),
+                install_bool = clean_boolean(row_so.get('INSTALL'))
+                so_payload = {
+                    "client_id": client_map.get(clean_val(row_so.get('CLIENT_NO'))),
+                    "stage": clean_val(row_so.get('STAGE')).upper() if clean_val(row_so.get('STAGE')) else 'QUOTE',
+                    "total": clean_money(row_so.get('TOTAL')),
+                    "deposit": clean_money(row_so.get('DEPOSIT')),
+                    "designer": clean_val(row_so.get('DESIGNER')),
+                    "comments": clean_text_multiline(row_so.get('COMMENTS')),
+                    "install": install_bool if install_bool is not None else False,
+                    # FIX: Default to 'Unknown'
+                    "order_type": clean_val(row_so.get('ORDER_TYPE')) or "Unknown",
+                    "delivery_type": clean_val(row_so.get('DEL_TYPE')) or "Unknown",
                     "sales_order_number": so_id,
+                    "created_at": clean_date_strict(row_so.get('DATE_SOLD')), 
                     "shipping": {
-                        "shipping_client_name": row_so.get('SHIP_LAST_NAME'),
-                        "shipping_street": row_so.get('SHIP_ADDRS'), "shipping_city": row_so.get('SHIP_CITY'),
-                        "shipping_province": row_so.get('SHIP_PROV'), "shipping_zip": row_so.get('SHIP_ZIP'),
-                        "shipping_phone_1": row_so.get('SHIP_PHONE1'), "shipping_phone_2": row_so.get('SHIP_PHONE2'),
-                        "shipping_email_1": row_so.get('SHIP_EMAIL1'), "shipping_email_2": row_so.get('SHIP_EMAIL2'),
+                        "shipping_client_name": clean_val(row_so.get('SHIP_LAST_NAME')),
+                        "shipping_street": clean_val(row_so.get('SHIP_ADDRS')),
+                        "shipping_city": clean_val(row_so.get('SHIP_CITY')),
+                        "shipping_province": clean_val(row_so.get('SHIP_PROV')),
+                        "shipping_zip": clean_val(row_so.get('SHIP_ZIP')),
+                        "shipping_phone_1": clean_val(row_so.get('SHIP_PHONE1')),
+                        "shipping_phone_2": clean_val(row_so.get('SHIP_PHONE2')),
+                        "shipping_email_1": clean_val(row_so.get('SHIP_EMAIL1')),
+                        "shipping_email_2": clean_val(row_so.get('SHIP_EMAIL2')),
                     },
                     "checklist": {
-                        "layout_date": clean_date(row_dc.get('LAYOUT')),
-                        "client_meeting_date": clean_date(row_dc.get('CLIENT_MEETING_DATE')),
-                        "follow_up_date": clean_date(row_so.get('FOLLOW_UPDATE')),
-                        "appliance_specs_date": clean_date(row_dc.get('APPLIANCE_SPECS')),
-                        "selections_date": clean_date(row_dc.get('SELECTIONS')),
-                        "markout_date": clean_date(row_so.get('SITE_MEASURE_DATE')),
-                        "review_date": clean_date(row_dc.get('REVIEW_DATE')),
-                        "second_markout_date": clean_date(row_so.get('SECOND_MEASURE_DATE')),
-                        "flooring_type": row_so.get('FLOORING_TYPE'), "flooring_clearance": row_so.get('FLOORING_CLEARENCE'),
+                        "layout_date": clean_date_strict(row_dc.get('LAYOUT')),
+                        "client_meeting_date": clean_date_strict(row_dc.get('CLIENT_MEETING_DATE')),
+                        "follow_up_date": clean_date_strict(row_so.get('FOLLOW_UPDATE')),
+                        "appliance_specs_date": clean_date_strict(row_dc.get('APPLIANCE_SPECS')),
+                        "selections_date": clean_date_strict(row_dc.get('SELECTIONS')),
+                        "markout_date": clean_date_strict(row_so.get('SITE_MEASURE_DATE')),
+                        "review_date": clean_date_strict(row_dc.get('REVIEW_DATE')),
+                        "second_markout_date": clean_date_strict(row_so.get('SECOND_MEASURE_DATE')),
+                        "flooring_type": clean_val(row_so.get('FLOORING_TYPE')),
+                        "flooring_clearance": clean_val(row_so.get('FLOORING_CLEARENCE')),
                     }
                 }
 
                 # C. Production
                 rush_val = clean_boolean(row_so.get('RUSH'))
-                prod_data = {
+                ship_date_val = clean_date_strict(row_so.get('DATE_SHIP'))
+                legacy_conf = clean_boolean(row_so.get('SHIP_DATE_CONFIRM'))
+                
+                if ship_date_val is None:
+                    final_ship_status = 'unprocessed'
+                else:
+                    final_ship_status = 'confirmed' if legacy_conf else 'unprocessed'
+
+                # FIX: In Plant Logic
+                doors_comp_val = clean_timestamp_special(row_so.get('DOORS_COMP'))
+                in_plant_val = doors_comp_val if doors_comp_val else None
+
+                prod_payload = {
                     "rush": rush_val if rush_val is not None else False,
-                    "placement_date": clean_date(row_so.get('PROD_IN_DATE')),
-                    "doors_in_schedule": clean_date(row_so.get('DATE_DOR_START')),
-                    "doors_out_schedule": clean_date(row_so.get('DATE_DOR_FIN')),
-                    "cut_finish_schedule": clean_date(row_so.get('ISSUE_DATE')),
-                    "cut_melamine_schedule": clean_date(row_so.get('MEL_DATE')),
-                    "paint_in_schedule": clean_date(row_so.get('PAINT_IN')),
-                    "paint_out_schedule": clean_date(row_so.get('PAINT_DATE')),
-                    "assembly_schedule": clean_date(row_so.get('ASS_DATE')),
-                    "ship_schedule": clean_date(row_so.get('DATE_SHIP')),
-                    "production_comments": row_so.get('PROD_MEMO'),
-                    "doors_completed_actual": clean_timestamp_special(row_so.get('DOORS_COMP')),
+                    "placement_date": clean_date_strict(row_so.get('PROD_IN_DATE')),
+                    "doors_in_schedule": clean_date_strict(row_so.get('DATE_DOR_START')),
+                    "doors_out_schedule": clean_date_strict(row_so.get('DATE_DOR_FIN')),
+                    "cut_finish_schedule": clean_date_strict(row_so.get('ISSUE_DATE')),
+                    "cut_melamine_schedule": clean_date_strict(row_so.get('MEL_DATE')),
+                    "paint_in_schedule": clean_date_strict(row_so.get('PAINT_IN')),
+                    "paint_out_schedule": clean_date_strict(row_so.get('PAINT_DATE')),
+                    "assembly_schedule": clean_date_strict(row_so.get('ASS_DATE')),
+                    "ship_schedule": ship_date_val,
+                    "production_comments": clean_text_multiline(row_so.get('PROD_MEMO')),
+                    # New Logic
+                    "in_plant_actual": in_plant_val,
+                    "doors_completed_actual": doors_comp_val,
                     "cut_finish_completed_actual": clean_timestamp_special(row_so.get('ISSUED')),
                     "cut_melamine_completed_actual": clean_timestamp_special(row_so.get('MEL__ISSUED')),
                     "paint_completed_actual": clean_timestamp_special(row_so.get('PAINT_COMP')),
                     "assembly_completed_actual": clean_timestamp_special(row_so.get('ASSEMBLED')),
-                    "custom_finish_completed_actual": clean_date(row_so.get('F_C_DATE')),
-                    "ship_status": 'confirmed' if clean_boolean(row_so.get('SHIP_DATE_CONFIRM')) else 'unprocessed', 
+                    "custom_finish_completed_actual": clean_date_strict(row_so.get('F_C_DATE')),
+                    "ship_status": final_ship_status, 
                 }
 
                 # D. Installation
-                install_data = {
-                    "installer_id": installer_map.get(str(row_so.get('INSTALL_ID', '')).strip()),
+                inst_payload = {
+                    "installer_id": installer_map.get(clean_val(row_so.get('INSTALL_ID'))),
                     "has_shipped": clean_boolean(row_so.get('HAS_SHIP')),
-                    "installation_date": clean_date(row_so.get('INSTALL_DATE')),
+                    "installation_date": clean_date_strict(row_so.get('INSTALL_DATE')),
                     "installation_completed": clean_timestamp_special(row_so.get('STATUS')),
-                    "inspection_date": clean_date(row_so.get('INSPECTION_DATE')),
-                    "wrap_date": clean_date(row_so.get('WRAP_DATE')),
+                    "inspection_date": clean_date_strict(row_so.get('INSPECTION_DATE')),
+                    "wrap_date": clean_date_strict(row_so.get('WRAP_DATE')),
                     "wrap_completed": clean_timestamp_special(row_so.get('WRAP_COMP')),
-                    "installation_notes": row_so.get('INSTALL_MEMO')
+                    "installation_notes": clean_text_multiline(row_so.get('INSTALL_MEMO'))
                 }
 
-                # E. Purchasing
-                purchasing_data = {
-                    "doors_ordered_at": clean_timestamp_special(row_so.get('DOORS_ORDERED')),
-                    "glass_ordered_at": clean_timestamp_special(row_so.get('GLASS_ORD')),
-                    "handles_ordered_at": clean_timestamp_special(row_oc.get('HANDLES')),
-                    "acc_ordered_at": clean_timestamp_special(row_oc.get('ACC')),
-                    "purchasing_comments": row_oc.get('COMMENTS')
-                }
-
-                # F. Job
+                # E. Job & Purchasing
                 base, suffix = parse_legacy_job_number(row_so.get('JOB_NUM'))
-                job_data = {
+                job_payload = {
                     "job_base_number": base,
                     "job_suffix": suffix,
                     "is_active": True
                 }
+                
+                purch_payload = {
+                    "doors_ordered_at": clean_timestamp_special(row_so.get('DOORS_ORDERED')),
+                    "glass_ordered_at": clean_timestamp_special(row_so.get('GLASS_ORD')),
+                    "handles_ordered_at": clean_timestamp_special(row_oc.get('HANDLES')),
+                    "acc_ordered_at": clean_timestamp_special(row_oc.get('ACC')),
+                    "purchasing_comments": clean_text_multiline(row_oc.get('COMMENTS'))
+                }
 
-                # --- TRANSACTION INSERT ---
-                with conn.begin(): 
-                    full_payload = {
-                        'cabinet': cabinet_data, 'sales_order': sales_order_data,
-                        'production': prod_data, 'installation': install_data,
-                        'purchasing': purchasing_data, 'job': job_data
-                    }
-                    
-                    # Validation Checks
-                    if not job_data['job_base_number']:
-                        print(f"❌ SKIP (SO {so_id}): Missing JOB_NUM in source.")
-                        skip_count += 1
-                        continue
-                        
-                    if not sales_order_data['client_id']:
-                         print(f"❌ SKIP (SO {so_id}): Client ID lookup failed for Legacy Client {row_so.get('CLIENT_NO')}")
+                # --- LOAD (INSERT) ---
+                with conn.begin():
+                    # 1. Check Dependencies
+                    if not so_payload['client_id']:
+                         print(f"❌ SKIP (SO {so_id}): Client Lookup Failed.", flush=True)
                          skip_count += 1
                          continue
 
-                    # Execute Insert
-                    insert_single_job(conn, full_payload)
-                    success_count += 1
+                    # 2. Always Insert Cabinet & Sales Order
+                    cab_id = insert_cabinet(conn, cabinet_payload)
+                    so_id_new = insert_sales_order(conn, so_payload, cab_id)
+
+                    # 3. Conditional Job Insertion
+                    if job_payload['job_base_number'] is not None:
+                        prod_id = insert_production(conn, prod_payload)
+                        inst_id = insert_installation(conn, inst_payload)
+                        job_id = insert_job(conn, job_payload, so_id_new, prod_id, inst_id)
+                        insert_purchasing(conn, purch_payload, job_id)
+                        success_jobs += 1
+                    else:
+                        success_quotes += 1
 
             except Exception as e:
-                print(f"❌ FAILED on SO {so_id}: {e}")
+                print(f"❌ FAILED on SO {so_id}: {e}", flush=True)
                 fail_count += 1
 
         print("\n" + "="*50)
-        print("🏁 MIGRATION COMPLETE")
-        print(f"✅ Success: {success_count}")
-        print(f"⚠️  Skipped: {skip_count}")
-        print(f"❌ Failed:  {fail_count}")
-        print("="*50)
+        print("🏁 MIGRATION COMPLETE", flush=True)
+        print(f"✅ Full Jobs Created: {success_jobs}", flush=True)
+        print(f"✅ Quotes Created:    {success_quotes}", flush=True)
+        print(f"⚠️  Skipped (No Client): {skip_count}", flush=True)
+        print(f"❌ Failed (Errors):    {fail_count}", flush=True)
+        print("="*50, flush=True)
 
 if __name__ == "__main__":
     migrate_jobs()
